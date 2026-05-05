@@ -10,7 +10,7 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.function.Consumer;
 
-public final class JdkHttpAdapter implements HttpAdapter, AutoCloseable {
+final class JdkHttpAdapter implements HttpAdapter, AutoCloseable {
 
     private static final int READ_BUFFER_SIZE = 64 * 1024; // 64 KiB
 

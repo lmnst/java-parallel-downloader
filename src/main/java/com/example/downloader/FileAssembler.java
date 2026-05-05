@@ -14,7 +14,7 @@ import java.nio.file.StandardOpenOption;
  * Lifecycle: open → [create sinks, write chunks] → commit (fsync + atomic move)
  *            or → abort (delete temp file, never touch destination)
  */
-public final class FileAssembler implements Closeable {
+final class FileAssembler implements Closeable {
 
     private final Path destination;
     private final Path tempFile;
@@ -22,7 +22,10 @@ public final class FileAssembler implements Closeable {
 
     private boolean closed = false;
 
-    public FileAssembler(Path destination) throws IOException {
+    FileAssembler(Path destination) throws IOException {
+        if (Files.isDirectory(destination)) {
+            throw new IOException("destination is a directory: " + destination);
+        }
         this.destination = destination;
         Path dir = destination.getParent();
         if (dir == null) dir = Path.of(".");
@@ -32,7 +35,7 @@ public final class FileAssembler implements Closeable {
     }
 
     /** Returns a sink that writes at the given byte offset in the temp file. */
-    public ChunkSink sinkAt(long offset) {
+    ChunkSink sinkAt(long offset) {
         return new ChunkSink(channel, offset);
     }
 
@@ -40,7 +43,7 @@ public final class FileAssembler implements Closeable {
      * Fsyncs the temp file and atomically moves it to the destination.
      * After this call the assembler is closed; do not call again.
      */
-    public void commit() throws IOException {
+    void commit() throws IOException {
         checkOpen();
         channel.force(true); // fsync data + metadata
         channel.close();
@@ -54,7 +57,7 @@ public final class FileAssembler implements Closeable {
      * Deletes the temp file without touching the destination.
      * Safe to call after commit() or multiple times.
      */
-    public void abort() {
+    void abort() {
         if (!closed) {
             closed = true;
             try { channel.close(); } catch (IOException ignored) {}
@@ -72,5 +75,5 @@ public final class FileAssembler implements Closeable {
         if (closed) throw new IllegalStateException("FileAssembler already closed");
     }
 
-    public Path tempFile() { return tempFile; }
+    Path tempFile() { return tempFile; }
 }

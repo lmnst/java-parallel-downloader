@@ -6,14 +6,14 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 
-public final class RetryPolicy {
+final class RetryPolicy {
 
     private static final Set<Integer> RETRYABLE_STATUS_CODES = Set.of(408, 429, 500, 502, 503, 504);
     private static final Duration MAX_BACKOFF = Duration.ofSeconds(30);
 
-    public sealed interface Trigger {
+    sealed interface Trigger {
         record HttpStatus(int statusCode, Duration retryAfterHint) implements Trigger {
-            public HttpStatus(int statusCode) { this(statusCode, Duration.ZERO); }
+            HttpStatus(int statusCode) { this(statusCode, Duration.ZERO); }
         }
         record IoFailure(IOException cause) implements Trigger {}
         record Timeout() implements Trigger {}
@@ -23,17 +23,17 @@ public final class RetryPolicy {
     private final Duration baseDelay;
     private final Random random;
 
-    public RetryPolicy(DownloaderOptions options, Random random) {
+    RetryPolicy(DownloaderOptions options, Random random) {
         this.maxRetries = options.maxRetriesPerChunk();
         this.baseDelay = options.retryBaseDelay();
         this.random = random;
     }
 
-    public RetryPolicy(DownloaderOptions options) {
+    RetryPolicy(DownloaderOptions options) {
         this(options, new Random());
     }
 
-    public Optional<Duration> evaluate(int attempt, Trigger trigger) {
+    Optional<Duration> evaluate(int attempt, Trigger trigger) {
         if (attempt >= maxRetries) return Optional.empty();
         if (!isRetryable(trigger)) return Optional.empty();
         return Optional.of(computeDelay(attempt, trigger));

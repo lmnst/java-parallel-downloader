@@ -1,8 +1,16 @@
 # Design Notes
 
-## Language & build choice
+## Why Java 21
 
-**Java 21** with **Gradle Kotlin DSL**. Java 21 is the current LTS and provides virtual threads (Project Loom, `Executors.newVirtualThreadPerTaskExecutor()`), sealed interfaces, and records — all used in this project. Zero runtime dependencies; test-only deps are JUnit 5 + AssertJ.
+Java 21 is the current LTS. It provides virtual threads (Project Loom), sealed interfaces, and records — all used here. Zero runtime dependencies; the only non-JDK code is JUnit 5 + AssertJ in test scope.
+
+## Why virtual threads
+
+Virtual threads let each concurrent chunk GET block on I/O without consuming an OS thread. Creating one per in-flight chunk is idiomatic and cheap (≈ 200 bytes of heap per unmounted thread). A `Semaphore(parallelism)` caps actual concurrent GETs at the configured limit while still using a `newVirtualThreadPerTaskExecutor()` for scheduling.
+
+## Why parallel Range GET — and when it is not beneficial
+
+Parallel Range GET saturates the available bandwidth from a CDN that serves objects from multiple edge nodes or that rate-limits per connection. For a single-connection server it adds no throughput and wastes connections. The downloader falls back to single-stream automatically when the server does not advertise `Accept-Ranges: bytes` or `parallelism` is 1.
 
 ## Architecture overview
 
@@ -11,49 +19,81 @@ Downloader (AutoCloseable)
 ├── HEAD preflight        → detect server capabilities
 ├── RangePlanner          → totalBytes + chunkSize → List<ByteRange>
 ├── FileAssembler         → temp-file lifecycle (open/write/fsync/atomic-move)
-│   └── ChunkSink         → positional FileChannel.write (thread-safe per FileChannel spec)
+│   └── ChunkSink         → positional FileChannel.write (thread-safe per JDK spec)
 ├── JdkHttpAdapter        → java.net.http.HttpClient (HEAD + ranged GET)
-│   └── FakeHttpAdapter   → in-memory test double (test sources only)
 └── RetryPolicy           → attempt + Trigger → Optional<Duration>
 ```
 
-## Parallel-download strategy
+All types except `Downloader`, `DownloaderOptions`, `DownloadResult`, `DownloadError`, `DownloadHandle`, `HttpAdapter`, and `ByteRange` are package-private implementation details.
 
-1. **HEAD preflight**: check `Accept-Ranges: bytes` and `Content-Length`.
-2. **Probe chunk 0 first**: send the first range request; if the server returns `200` (not `206`), the full body is already in the temp file — commit and report `chunks=1`. This prevents corruption when a server advertises range support in `HEAD` but ignores `Range` in `GET`.
-3. **Parallel chunks 1..N**: submitted to a virtual-thread-per-task executor; bounded by `parallelism` option. Each chunk writes directly to its byte offset in the temp file using positional `FileChannel.write`, which the JDK specifies as safe for concurrent writes at non-overlapping positions.
-4. **Atomic commit**: `FileChannel.force(true)` (fsync) followed by `Files.move(..., ATOMIC_MOVE)`. If any step fails, `abort()` deletes the `.part` file; the destination is never touched.
+## Range planning and inclusive byte boundaries
 
-## The 200-vs-206 hazard
+`Range: bytes=a-b` is inclusive on both ends per RFC 9110. `ByteRange(offset, length)` computes `lastByte = offset + length - 1` and formats as `bytes=offset-lastByte`. `RangePlanner` covers exactly `totalBytes` without overlap or gap, verified by property tests across random sizes and chunk sizes.
 
-Some servers advertise `Accept-Ranges: bytes` in a `HEAD` response but return `200` with the full body when they receive a `GET` with a `Range` header. If we blindly launch all chunks in parallel and they all get `200` + full body, each chunk would write the full content starting at its designated offset — corrupting the file.
+## The `200 OK` vs `206 Partial Content` corruption hazard
 
-**Our mitigation**: probe chunk 0 synchronously before launching other chunks. If it gets `200`, we treat the body it already wrote (from offset 0) as the complete file, skip the parallel phase, and commit. Other chunks never run, so there is no window for corruption.
+Some servers advertise `Accept-Ranges: bytes` in HEAD but return `200` with the full body when they receive a ranged GET. If we launched all chunks simultaneously and each received the full body, every chunk would write the complete file starting at its offset — corrupting the output.
 
-A future improvement is `If-Range` (see below).
+**Mitigation**: chunk 0 is always downloaded synchronously as a probe before other chunks start. If the probe returns `200`, we treat the body already in the temp file (written at offset 0) as the complete download, skip all other chunks, and commit. No parallel work has run, so there is no window for corruption.
+
+## `Content-Range` validation
+
+For every `206` response on a ranged GET, the returned `Content-Range` header (if present) is validated against the requested range:
+
+- `start` must equal `range.offset()`
+- `end` must equal `range.lastByte()`
+- `total` (if not `*`) must equal the `Content-Length` from HEAD
+
+A mismatch means the server returned data for the wrong byte range and the write would corrupt the file. The download fails immediately with `IO_ERROR`; the `.part` file is deleted.
+
+If `Content-Range` is absent on a `206` response, the response is tolerated. RFC 9110 §14.4 does not require the header when the response covers the exact requested range, and some CDNs omit it.
+
+## HEAD/GET consistency and `If-Range`
+
+Without `If-Range`, if the server replaces or truncates the file between the HEAD request and the chunk GETs, the downloader may either fail with `SIZE_MISMATCH` (if the byte count changes) or silently produce a mix of old and new bytes (if the byte count stays the same). This residual risk is accepted.
+
+`JdkHttpAdapter` captures the `ETag` from HEAD (stored in `HeadResponse.etag()`), but this value is not sent on chunk GET requests. Implementing `If-Range` would require adding an `ifRange` parameter to `HttpAdapter.get()`, passing the validator into each ranged GET, and treating a `200` response (resource changed or Range became invalid) as a typed `RESOURCE_CHANGED` failure. That is explicitly future work.
+
+## Atomic write strategy and failure cleanup guarantees
+
+`FileAssembler` creates a temp file in the same directory as the destination (so `Files.move` stays on the same filesystem and `ATOMIC_MOVE` is available). The lifecycle:
+
+1. `open` — `Files.createTempFile(destinationDir, name., .part)`
+2. `write` — concurrent `FileChannel.write(buf, position)` calls at non-overlapping offsets (thread-safe per JDK spec)
+3. `commit` — `FileChannel.force(true)` (fsync data + metadata), then `Files.move(temp, dest, ATOMIC_MOVE, REPLACE_EXISTING)`
+4. `abort` — channel close + `Files.deleteIfExists(temp)`
+
+**Success**: destination exists and is complete.  
+**Any failure before commit**: `abort()` is called; `.part` is deleted; destination is never written.  
+**Existing destination on failure**: because the temp file is deleted and `ATOMIC_MOVE` never ran, the original destination file is left intact.  
+**Destination is a directory**: detected in the `FileAssembler` constructor before any temp file is created; fails with `IO_ERROR`.
+
+`abort()` and `close()` are both idempotent.
 
 ## Retry policy
 
-Retryable: `408`, `429`, `500`, `502`, `503`, `504`; `IOException`; connect/read timeout.
-Not retried: all other `4xx` (auth failures, not-found, etc.).
+Retryable triggers: HTTP `408`, `429`, `500`, `502`, `503`, `504`; `IOException`; connect/read timeout.  
+Not retried: all other `4xx` codes (auth failure, not-found, etc.). `Content-Range` validation and truncated-body checks run outside the per-chunk retry loop in `Downloader`, so a protocol violation fails the entire download immediately rather than triggering a retry. Future refactors should preserve this invariant by keeping those checks outside `downloadChunk`.
 
-Delay formula: `random(0, min(30s, baseDelay × 2^attempt))` — full jitter prevents thundering-herd. If the server provides `Retry-After` on `429`/`503`, that duration is used directly.
+Delay formula: `random(0, min(30 s, baseDelay × 2^attempt))` — full jitter prevents thundering-herd. Server-provided `Retry-After` on `429`/`503` overrides the formula.
 
-## Tuning rationale for defaults
+## Resource ownership and cleanup
 
-| Option | Default | Rationale |
-|---|---|---|
-| `chunkSize = 8 MiB` | Amortises TCP slow-start and HTTP overhead; 8 chunks of 8 MiB covers a 64 MiB file cleanly |
-| `parallelism = 8` | Empirical sweet spot for a single CDN host on a 1 Gbps link without overwhelming the server |
-| `connectTimeout = 10 s` | Long enough for geo-distributed CDN but short enough to detect dead hosts |
-| `requestTimeout = 60 s` | Covers a full 8 MiB chunk at ~1 Mbps |
-| `maxRetriesPerChunk = 3` | Handles transient CDN blips without waiting forever |
-| `retryBaseDelay = 200 ms` | At attempt 2, expected wait ≈ 400 ms; acceptable for interactive use |
+`Downloader` owns the `HttpClient` created inside `JdkHttpAdapter` and closes it in `Downloader.close()`. If an externally provided `HttpAdapter` is injected (test or custom), and it implements `AutoCloseable`, it is also closed via the pattern-match in `close()`. `ExecutorService` pools in `downloadAsync` and `downloadChunksParallel` are both used in try-with-resources (Java 21 `AutoCloseable` support).
 
-## Out of scope
+## What is deliberately out of scope
 
-- **`If-Range` / ETag resumption**: after a retry mid-chunk, we re-download the whole chunk from its start offset. A proper `If-Range` + `ETag` implementation would resume from the exact byte position, but adds significant state management and is rarely needed for chunk sizes ≤ 16 MiB.
-- **Checksum validation against a manifest**: the library verifies `Content-Length` but does not fetch or validate an external SHA-256 manifest. Callers can verify the result path themselves.
-- **Bandwidth throttling / rate limiting**: not implemented; callers can reduce `parallelism` and `chunkSize` to limit throughput.
-- **HTTP/2 multiplexing**: `java.net.http.HttpClient` uses HTTP/2 when the server supports it. We don't explicitly disable it, but we also don't tune for it.
-- **Progress callbacks**: the public API returns a completed `DownloadResult`; streaming progress events would require a callback interface or reactive streams.
+- **`If-Range` / per-chunk ETag resumption**: adds significant state threading; useful for chunk sizes > 64 MiB where a mid-chunk retry wastes meaningful bandwidth.
+- **Caller-supplied SHA-256 verification**: callers can re-read the result path with `MessageDigest`. The property test suite verifies end-to-end byte identity via SHA-256 across 40+ random (size, chunk-size) combinations.
+- **Progress callbacks**: would require a callback interface or reactive streams; the `DownloadResult.Success` record reports final byte count and elapsed time.
+- **Bandwidth throttling**: reduce `parallelism` and `chunkSize`.
+- **HTTP/2 multiplexing**: `HttpClient` negotiates HTTP/2 automatically when the server supports it.
+- **Multi-source / torrent-style**: each download targets one URI.
+- **CLI**, **GUI**, **resume/checkpoint**, **authentication**, **metrics framework**.
+
+## What I would add with one more day
+
+1. **`If-Range` on each chunk GET**: wire `HeadResponse.etag()` into `JdkHttpAdapter.get()` when a range is requested; handle `200` fallback as a typed `RESOURCE_CHANGED` error.
+2. **Optional SHA-256 in `DownloaderOptions`**: stream the committed temp file through `MessageDigest` before the atomic move; one algorithm, 64 KiB buffer, delete `.part` on mismatch.
+3. **A thin CLI** (`Main.run(String[])` returning an exit code) with `./gradlew run` support, no framework dependencies.
+4. **Bandwidth measurement**: track bytes/second per chunk so the `Success` result can report effective throughput.

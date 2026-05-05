@@ -10,7 +10,7 @@ import java.util.function.Consumer;
  * at a fixed starting offset. Each write appends after the previous one within
  * this chunk's region.
  */
-public final class ChunkSink implements Consumer<ByteBuffer> {
+final class ChunkSink implements Consumer<ByteBuffer> {
 
     private final FileChannel channel;
     private long position;
