@@ -36,17 +36,17 @@ destination behind.
 
 ## Quick demo
 
-The CLI downloads a file in parallel and prints a structured report.
-
 ```bash
-# 1. Generate a 64 MiB random file
-mkdir -p /tmp/corpus && head -c $((64 * 1024 * 1024)) /dev/urandom > /tmp/corpus/test.bin
+# 1. Build the CLI distribution (one-time)
+./gradlew installDist
+DL=build/install/parallel-downloader/bin/parallel-downloader
 
-# 2. Serve it from an Apache container
+# 2. Generate a 64 MiB random file and serve it from an Apache container
+mkdir -p /tmp/corpus && head -c $((64 * 1024 * 1024)) /dev/urandom > /tmp/corpus/test.bin
 docker run --rm -d -p 8080:80 -v /tmp/corpus:/usr/local/apache2/htdocs/ --name dl-httpd httpd:2.4
 
 # 3. Download it
-./gradlew run --args="--url http://localhost:8080/test.bin --out /tmp/downloaded.bin --report json"
+$DL --url http://localhost:8080/test.bin --out /tmp/downloaded.bin --report json
 
 # 4. Tear down
 docker stop dl-httpd
@@ -59,9 +59,16 @@ Sample JSON output:
  "chunkDetails":[{"index":0,"offset":0,"length":8388608,"attempts":1,"durationMs":30}, ...]}
 ```
 
-Run `./gradlew run --args="--help"` for the full flag and exit-code reference.
-A `justfile` is included with `just demo`, `just test`, `just integration`,
-`just chaos` shortcuts.
+Run `$DL --help` for the full flag and exit-code reference. A `justfile`
+is included with `just demo`, `just test`, `just integration`, `just chaos`
+shortcuts.
+
+> **Note on `./gradlew run` and exit codes.** Gradle wraps the JVM's exit
+> code, so a typed CLI failure (e.g. exit 4 for `INTEGRITY_FAILURE`)
+> surfaces as `BUILD FAILED, exit 1` and the structured report is
+> swallowed by Gradle's banner. The examples below all invoke
+> `build/install/parallel-downloader/bin/parallel-downloader` directly so
+> the per-error exit codes are preserved verbatim.
 
 ## Public API
 
@@ -112,6 +119,48 @@ cli.Main              — entry point for ./gradlew run
 | `resumeStrategy` | `FRESH` | `RESUME_IF_VALID` opts in to sidecar resumption |
 | `progressListener` | `NO_OP` | Receives `ProgressEvent`s on a single virtual thread |
 
+## Performance
+
+64 MiB file served from an httpd:2.4 container with 50 ms one-way netem
+delay applied to its `eth0` (≈100 ms HEAD round-trip), 4 MiB chunks,
+median of three runs (CLI's own `elapsedMs`, JVM startup excluded):
+
+| `--parallelism` | Median time | Throughput | Speedup |
+|---:|---:|---:|---:|
+| 1 (single-stream) | 2929 ms | 21.8 MiB/s | 1.00× |
+| 4                 | 1298 ms | 49.3 MiB/s | 2.26× |
+| 8                 |  995 ms | 64.3 MiB/s | 2.94× |
+| 16                |  827 ms | 77.4 MiB/s | 3.54× |
+
+Diminishing returns are visible above `parallelism = 8` — the file is
+only 16 chunks at 4 MiB, so 16 saturates the chunk count, and the
+remaining wall-clock cost is dominated by the slowest chunk's TCP
+slow-start ramp rather than serialised RTTs.
+
+#### How this was measured
+
+The container is configured with `--cap-add=NET_ADMIN` so a single
+`tc qdisc` rule injects RTT inside its network namespace; nothing on the
+host is touched.
+
+```bash
+docker run --rm -d --name dl-bench --cap-add=NET_ADMIN -p 8090:80 \
+    -v /tmp/bench-corpus:/usr/local/apache2/htdocs/ httpd:2.4
+docker exec dl-bench bash -c \
+    "apt-get update -qq && apt-get install -y -qq iproute2 && \
+     tc qdisc add dev eth0 root netem delay 50ms"
+
+for P in 1 4 8 16; do
+    rm -f /tmp/dl.bin
+    "$DL" --url http://localhost:8090/test.bin --out /tmp/dl.bin \
+        --parallelism "$P" --chunk-size 4M --report json
+done
+```
+
+Numbers were collected on an Apple Silicon laptop in May 2026; absolute
+times will vary by hardware, but the relative shape (super-linear gain
+through `p=4`, plateau around `p=8`) is the load-bearing claim.
+
 ## Resumability
 
 Pass `--resume` (library: `DownloaderOptions.resumeStrategy(RESUME_IF_VALID)`).
@@ -128,10 +177,10 @@ old and new bytes.
 
 ```bash
 # First attempt is interrupted
-./gradlew run --args="--url https://example.com/big.bin --out /tmp/big.bin --resume"
+$DL --url https://example.com/big.bin --out /tmp/big.bin --resume
 
 # Re-run with the same flag — only missing chunks are re-fetched:
-./gradlew run --args="--url https://example.com/big.bin --out /tmp/big.bin --resume"
+$DL --url https://example.com/big.bin --out /tmp/big.bin --resume
 ```
 
 `FRESH` mode (the default) ignores any existing `.part` / `.part.json` files.
@@ -148,10 +197,12 @@ _before_ the atomic move, so the destination path is never written.
 verification ran, empty otherwise.
 
 ```bash
-$ ./gradlew run --args="--url http://localhost:8080/test.bin --out /tmp/x.bin \
-    --sha256 0000000000000000000000000000000000000000000000000000000000000000 --report json"
+$ $DL --url http://localhost:8080/test.bin --out /tmp/x.bin \
+      --sha256 0000000000000000000000000000000000000000000000000000000000000000 --report json
 {"status":"failure","error":"INTEGRITY_FAILURE","exitCode":4,
  "cause":"integrity check failed: expected SHA-256 0000... got b5d4..."}
+$ echo $?
+4
 ```
 
 ## Progress and reporting
