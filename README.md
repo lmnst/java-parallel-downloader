@@ -146,11 +146,11 @@ CLI flag reference and exit codes are in
 
 ## Tests
 
-| Suite | Tests | Run with | What it covers |
+| Layer | Tests | Run with | What it covers |
 |---|---:|---|---|
-| Default (unit + property + in-process) | 163 | `./gradlew test` | Range planner, manifest, retry policy, file assembler, downloader, integrity, progress, CLI parser, plus a 40-case property pass over random sizes and chunk sizes, and a 10-case in-process integration suite against the JDK `HttpServer`. |
-| Chaos | 121 | `./gradlew test -PchaosTests` | 120 seeded `ChaosPropertyTest` runs (14 fault classes per GET) plus one `ChaosResumeTest` that composes chaos with resume. |
-| Docker integration | 1 | `RUN_DOCKER_IT=1 ./gradlew test -PintegrationTests` | End-to-end through the installed CLI against `httpd:2.4` via Testcontainers. |
+| Default (unit, property, in-process integration) | 163 | `./gradlew test` | Range planner, manifest, retry policy, file assembler, downloader, integrity, progress, CLI parser, plus a 40-case property pass over random sizes and chunk sizes and a 10-case in-process suite against the JDK `HttpServer`. |
+| Chaos (added by `-PchaosTests`) | 121 | `./gradlew test -PchaosTests` | 120 seeded `ChaosPropertyTest` runs (14 fault classes per GET) plus one `ChaosResumeTest` that composes chaos with resume. Chaos opts in *on top of* the default 163, so the gradle task runs 284 tests total. |
+| Docker integration (added by `-PintegrationTests`) | 1 | `RUN_DOCKER_IT=1 ./gradlew test -PintegrationTests` | End-to-end through the installed CLI against `httpd:2.4` via Testcontainers. The `RUN_DOCKER_IT=1` gate makes Docker absence a hard failure rather than a silent skip. |
 
 Property tests are folded into the default suite (`PropertyTest` is one
 of the 163), not split out into a separate run. The chaos suite is
