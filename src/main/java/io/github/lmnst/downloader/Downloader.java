@@ -200,73 +200,21 @@ public final class Downloader implements AutoCloseable {
             throws IOException, InterruptedException {
 
         RetryPolicy retry = new RetryPolicy(options);
+        ResumeContext resume = setupOrLoadManifest(uri, head, asm, resumeMode);
+        Manifest manifest = resume == null ? null : resume.manifest();
+        String ifRange    = resume == null ? null : resume.ifRange();
 
-        // ── manifest setup (resume mode only) ──────────────────────────────────
-        Manifest manifest = null;
-        String ifRange = null;
-        if (resumeMode) {
-            Path manifestPath = asm.manifestFile();
-            if (Files.exists(manifestPath)) {
-                Manifest existing;
-                try {
-                    existing = Manifest.read(manifestPath);
-                } catch (IOException e) {
-                    throw new ResourceChangedException("manifest unreadable: " + e.getMessage());
-                }
-                if (!Objects.equals(existing.url, uri)) {
-                    throw new ResourceChangedException(
-                            "manifest URL " + existing.url + " differs from " + uri);
-                }
-                if (!existing.matchesHead(head, options.chunkSize())) {
-                    throw new ResourceChangedException(
-                            "manifest validators no longer match HEAD response");
-                }
-                manifest = existing;
-            } else {
-                manifest = Manifest.forNewDownload(uri, head, options.chunkSize());
-                manifest.writeAtomically(manifestPath);
-            }
-            ifRange = manifest.etag; // null = no If-Range header sent
-        }
-
-        // ── probe chunk 0 (synchronously) ──────────────────────────────────────
         ByteRange firstRange = ranges.get(0);
-        if (manifest == null || !manifest.isCompleted(0)) {
-            HttpAdapter.GetResponse probe =
-                    downloadChunk(0, firstRange, uri, asm, cancel, retry, ifRange, progress);
-
-            if (probe.ifRangeMismatch()) {
-                throw new ResourceChangedException(
-                        "If-Range validator mismatch: server returned 200 on a ranged GET");
-            }
-
-            if (probe.status() == 200) {
-                long total = probe.bytesWritten();
-                if (head.contentLength() > 0 && total != head.contentLength()) {
-                    throw new SizeMismatchException(head.contentLength(), total);
-                }
+        boolean firstChunkAlreadyDone = manifest != null && manifest.isCompleted(0);
+        if (!firstChunkAlreadyDone) {
+            ProbeOutcome probe = probeFirstChunk(uri, head, firstRange, asm, cancel,
+                    retry, ifRange, progress, manifest);
+            if (probe.fullDownload()) {
                 Optional<byte[]> sha = verifyAndCommit(asm);
-                return success(dest, total, startNanos, 1, sha);
-            }
-
-            if (probe.status() != 206) {
-                throw new HttpStatusException(probe.status());
-            }
-
-            validateContentRange(probe.contentRangeHeader(), firstRange, head.contentLength());
-
-            if (probe.bytesWritten() != firstRange.length()) {
-                throw new IOException("probe chunk truncated: got " + probe.bytesWritten()
-                        + " of " + firstRange.length() + " bytes");
-            }
-
-            if (manifest != null) {
-                manifest.markComplete(0);
-                manifest.writeAtomically(asm.manifestFile());
+                return success(dest, probe.bytesWritten(), startNanos, 1, sha);
             }
         }
 
-        // ── parallel chunks 1..N-1 (skip already-completed) ────────────────────
         if (ranges.size() > 1) {
             downloadChunksParallel(uri, ranges, asm, cancel, retry,
                     head.contentLength(), manifest, ifRange, progress);
@@ -283,6 +231,96 @@ public final class Downloader implements AutoCloseable {
         Optional<byte[]> sha = verifyAndCommit(asm);
         return success(dest, expected, startNanos, ranges.size(), sha);
     }
+
+    /**
+     * Reads or creates the resume sidecar in {@code RESUME_IF_VALID} mode and
+     * returns the manifest plus the {@code If-Range} validator. Returns
+     * {@code null} when {@code resumeMode} is false. Throws
+     * {@link ResourceChangedException} if an existing manifest disagrees with
+     * the current HEAD (URL, validators, content length, or chunk size).
+     */
+    private ResumeContext setupOrLoadManifest(URI uri, HttpAdapter.HeadResponse head,
+                                              FileAssembler asm, boolean resumeMode)
+            throws IOException {
+        if (!resumeMode) return null;
+
+        Path manifestPath = asm.manifestFile();
+        Manifest manifest;
+        if (Files.exists(manifestPath)) {
+            Manifest existing;
+            try {
+                existing = Manifest.read(manifestPath);
+            } catch (IOException e) {
+                throw new ResourceChangedException("manifest unreadable: " + e.getMessage());
+            }
+            if (!Objects.equals(existing.url, uri)) {
+                throw new ResourceChangedException(
+                        "manifest URL " + existing.url + " differs from " + uri);
+            }
+            if (!existing.matchesHead(head, options.chunkSize())) {
+                throw new ResourceChangedException(
+                        "manifest validators no longer match HEAD response");
+            }
+            manifest = existing;
+        } else {
+            manifest = Manifest.forNewDownload(uri, head, options.chunkSize());
+            manifest.writeAtomically(manifestPath);
+        }
+        return new ResumeContext(manifest, manifest.etag); // null etag = no If-Range header
+    }
+
+    /**
+     * Synchronously fetches chunk 0 to detect the 200-on-ranged-GET hazard
+     * before any other chunk fans out. Returns {@link ProbeOutcome#fullDownload()}
+     * when the server returned the entire body (single-chunk path); otherwise
+     * validates the 206 response's {@code Content-Range} and byte count, marks
+     * the chunk complete in the manifest if one is present, and returns a
+     * partial-mode outcome so the caller proceeds to fan out the rest.
+     */
+    private ProbeOutcome probeFirstChunk(URI uri, HttpAdapter.HeadResponse head,
+                                         ByteRange firstRange, FileAssembler asm,
+                                         CancelToken cancel, RetryPolicy retry,
+                                         String ifRange, ProgressDispatcher progress,
+                                         Manifest manifest)
+            throws IOException, InterruptedException {
+
+        HttpAdapter.GetResponse probe =
+                downloadChunk(0, firstRange, uri, asm, cancel, retry, ifRange, progress);
+
+        if (probe.ifRangeMismatch()) {
+            throw new ResourceChangedException(
+                    "If-Range validator mismatch: server returned 200 on a ranged GET");
+        }
+
+        if (probe.status() == 200) {
+            long total = probe.bytesWritten();
+            if (head.contentLength() > 0 && total != head.contentLength()) {
+                throw new SizeMismatchException(head.contentLength(), total);
+            }
+            return new ProbeOutcome(true, total);
+        }
+
+        if (probe.status() != 206) {
+            throw new HttpStatusException(probe.status());
+        }
+
+        validateContentRange(probe.contentRangeHeader(), firstRange, head.contentLength());
+
+        if (probe.bytesWritten() != firstRange.length()) {
+            throw new IOException("probe chunk truncated: got " + probe.bytesWritten()
+                    + " of " + firstRange.length() + " bytes");
+        }
+
+        if (manifest != null) {
+            manifest.markComplete(0);
+            manifest.writeAtomically(asm.manifestFile());
+        }
+        return new ProbeOutcome(false, firstRange.length());
+    }
+
+    private record ResumeContext(Manifest manifest, String ifRange) {}
+
+    private record ProbeOutcome(boolean fullDownload, long bytesWritten) {}
 
     private void downloadChunksParallel(URI uri, List<ByteRange> allRanges,
                                         FileAssembler asm, CancelToken cancel,
