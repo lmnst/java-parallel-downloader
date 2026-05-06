@@ -225,6 +225,72 @@ Not retried: all other `4xx` codes (auth failure, not-found, etc.). `Content-Ran
 
 Delay formula: `random(0, min(30 s, baseDelay × 2^attempt))` — full jitter prevents thundering-herd. Server-provided `Retry-After` on `429`/`503` overrides the formula.
 
+## Chaos testing
+
+The downloader's correctness claims — "any failure leaves no artifact at the
+destination, and any success delivers the source bytes verbatim" — are
+straightforward to prove for an individual error path with a hand-written test.
+What's harder is proving they hold under arbitrary mixtures of those errors
+across concurrent chunks. A single hand-written test for "503 on chunk 0,
+truncated body on chunk 2, mid-body socket reset on chunk 5, malformed
+Content-Range on chunk 6" is fragile, expensive to write, and doesn't
+generalize.
+
+The chaos suite (`@Tag("chaos")`, opt-in via `-PchaosTests`) replaces that
+exhaustive-by-hand exercise with a property test seeded by a deterministic
+RNG. `ChaosHttpAdapter` exposes 14 fault classes and picks one per GET from a
+weighted distribution; `ChaosPropertyTest` runs the downloader against it
+under 120 seeds and asserts:
+
+> **Invariant.** The download ends in exactly one of two states.
+>
+> 1. `DownloadResult.Success` — the destination file's SHA-256 matches the
+>    source corpus; nothing else.
+> 2. `DownloadResult.Failure` with a typed `DownloadError`, the destination
+>    does not exist, and no `.part` / `.part.json` / `.part.json.tmp` files
+>    linger on disk.
+
+A success with corrupted bytes, a failure with a half-written destination, or
+a failure that lingers `.part` artifacts in fresh mode are all assertion
+failures with a printable seed. Replaying with the same seed reproduces the
+exact fault sequence.
+
+### Fault classes
+
+- HTTP `408`, `429`, `500`, `502`, `503`, `504` (status-only — chunk gets
+  retried; if retries exhaust, the typed `HTTP_ERROR` failure path runs)
+- HTTP `200` on a ranged GET (the corruption hazard the probe-chunk defends
+  against in FRESH mode; `ifRangeMismatch` triggers `RESOURCE_CHANGED` in
+  RESUME mode)
+- `206` with truncated body (caught by the per-chunk byte-count check)
+- `206` with malformed `Content-Range` header
+- `206` with `Content-Range` mismatching the requested range
+- `IOException` mid-body (simulated socket reset; retried)
+- Slowloris (1 ms-per-byte, capped to 16 bytes — long enough to exercise the
+  trickle path, short enough to keep the suite under a second)
+- Per-chunk delay jitter (sleep 0–50 ms before responding)
+- Pass-through (no fault — the success branch must dominate frequently
+  enough that a property run isn't all failures)
+
+### Why in-process
+
+Chaos tests are deliberately in-process (`HttpAdapter` injection, no
+Testcontainers) for two reasons:
+
+- **Speed.** 120 seeded runs over a 64 KiB corpus complete in under a
+  second on a developer machine. A Docker round-trip per seed would push
+  the suite into minutes, and slow chaos suites stop being run.
+- **Determinism.** A real HTTP server's faults aren't reproducible with a
+  seed; an in-process adapter's are. When a regression slips in, the seed
+  in the assertion message is enough to bisect.
+
+### Past offenders
+
+When this harness catches a regression, record the seed and the commit it
+caught in `ChaosHttpAdapter`'s class Javadoc. That paper-trail is more
+valuable than any single test method: it shows the harness was used, not
+just built.
+
 ## Resource ownership and cleanup
 
 `Downloader` owns the `HttpClient` created inside `JdkHttpAdapter` and closes it in `Downloader.close()`. If an externally provided `HttpAdapter` is injected (test or custom), and it implements `AutoCloseable`, it is also closed via the pattern-match in `close()`. `ExecutorService` pools in `downloadAsync` and `downloadChunksParallel` are both used in try-with-resources (Java 21 `AutoCloseable` support).

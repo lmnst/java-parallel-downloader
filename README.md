@@ -217,6 +217,22 @@ ProgressEvent         — sealed: Started | ChunkCompleted | Failed | Finished
 cli.Main              — entry point for ./gradlew run
 ```
 
+## Chaos testing
+
+A property-based suite (`-PchaosTests`) runs the downloader against an
+in-process `HttpAdapter` that, on every GET, samples one of fourteen fault
+classes (HTTP 408/429/5xx, 200-on-ranged-GET, truncated bodies, malformed
+or mismatching `Content-Range`, mid-body `IOException`, slowloris, jitter)
+from a deterministic seeded RNG. 120 seeds run in under a second and assert
+the headline invariant: every download ends with either `Success` and the
+correct bytes, or `Failure` with a typed `DownloadError` and no leftover
+artifacts on disk. See **[Chaos testing](DESIGN.md#chaos-testing)** in
+DESIGN.md for the full fault list and the reproduction story.
+
+```bash
+./gradlew test -PchaosTests   # ~1 s for 120 seeds
+```
+
 ## Design
 
 See [DESIGN.md](DESIGN.md) for decisions, edge-case analysis, and trade-offs.
