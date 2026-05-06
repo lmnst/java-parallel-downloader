@@ -307,7 +307,7 @@ public final class Main {
         j.append(']');
     }
 
-    private static int exitCodeFor(DownloadResult.Failure f) {
+    static int exitCodeFor(DownloadResult.Failure f) {
         return switch (f.error()) {
             case HTTP_ERROR -> {
                 if (f.cause() instanceof HttpStatusException hse) {
