@@ -5,6 +5,8 @@ import com.example.downloader.Downloader;
 import com.example.downloader.DownloaderOptions;
 import com.example.downloader.DownloadResult;
 import com.example.downloader.HttpStatusException;
+import com.example.downloader.ProgressEvent;
+import com.example.downloader.ProgressListener;
 import com.example.downloader.ResumeStrategy;
 
 import java.io.PrintStream;
@@ -74,11 +76,20 @@ public final class Main {
             return EXIT_SUCCESS;
         }
 
-        DownloaderOptions opts = buildOptions(parsed);
+        // Pick a progress listener based on the report mode:
+        //   text → ConsoleProgressListener (live `\r`-overwriting status line)
+        //   json → JsonAccumulator (silent; per-chunk details fed into final JSON)
+        boolean tty = System.console() != null;
+        JsonAccumulator jsonAccum = parsed.report == Report.JSON ? new JsonAccumulator() : null;
+        ProgressListener listener = jsonAccum != null
+                ? jsonAccum
+                : new ConsoleProgressListener(out, tty);
+
+        DownloaderOptions opts = buildOptions(parsed, listener);
 
         try (Downloader downloader = new Downloader(opts)) {
             DownloadResult result = downloader.download(parsed.url, parsed.out);
-            return report(result, parsed.report, out, err);
+            return report(result, parsed.report, jsonAccum, out, err);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             err.println("interrupted");
@@ -210,25 +221,22 @@ public final class Main {
 
     // ── options + reporting ──────────────────────────────────────────────────
 
-    private static DownloaderOptions buildOptions(Args a) {
+    private static DownloaderOptions buildOptions(Args a, ProgressListener listener) {
         DownloaderOptions.Builder b = DownloaderOptions.builder();
         if (a.chunkSize != null) b.chunkSize(a.chunkSize);
         if (a.parallelism != null) b.parallelism(a.parallelism);
         if (a.sha256 != null) b.expectedDigest(Algorithm.SHA_256, a.sha256);
         if (a.resume) b.resumeStrategy(ResumeStrategy.RESUME_IF_VALID);
+        b.progressListener(listener);
         return b.build();
     }
 
-    private static int report(DownloadResult result, Report fmt, PrintStream out, PrintStream err) {
+    private static int report(DownloadResult result, Report fmt, JsonAccumulator chunks,
+                              PrintStream out, PrintStream err) {
         return switch (result) {
             case DownloadResult.Success s -> {
                 if (fmt == Report.JSON) {
-                    out.println("{\"status\":\"success\""
-                            + ",\"file\":\"" + jsonEscape(s.file().toString()) + "\""
-                            + ",\"bytes\":" + s.bytes()
-                            + ",\"elapsedMs\":" + s.elapsed().toMillis()
-                            + ",\"chunks\":" + s.chunks()
-                            + "}");
+                    out.println(jsonSuccess(s, chunks));
                 } else {
                     out.printf("Downloaded %d bytes in %s (%d chunks) -> %s%n",
                             s.bytes(), formatDuration(s.elapsed()), s.chunks(), s.file());
@@ -238,12 +246,7 @@ public final class Main {
             case DownloadResult.Failure f -> {
                 int code = exitCodeFor(f);
                 if (fmt == Report.JSON) {
-                    String causeMsg = f.cause() == null ? "" : nullSafe(f.cause().getMessage());
-                    out.println("{\"status\":\"failure\""
-                            + ",\"error\":\"" + f.error() + "\""
-                            + ",\"exitCode\":" + code
-                            + ",\"cause\":\"" + jsonEscape(causeMsg) + "\""
-                            + "}");
+                    out.println(jsonFailure(f, code, chunks));
                 } else {
                     err.println("download failed: " + f.error()
                             + (f.cause() != null ? " - " + f.cause().getMessage() : ""));
@@ -251,6 +254,46 @@ public final class Main {
                 yield code;
             }
         };
+    }
+
+    private static String jsonSuccess(DownloadResult.Success s, JsonAccumulator chunks) {
+        StringBuilder j = new StringBuilder()
+                .append("{\"status\":\"success\"")
+                .append(",\"file\":\"").append(jsonEscape(s.file().toString())).append('"')
+                .append(",\"bytes\":").append(s.bytes())
+                .append(",\"elapsedMs\":").append(s.elapsed().toMillis())
+                .append(",\"chunks\":").append(s.chunks());
+        s.sha256().ifPresent(h -> j
+                .append(",\"sha256\":\"").append(HexFormat.of().formatHex(h)).append('"'));
+        appendChunkDetails(j, chunks);
+        return j.append('}').toString();
+    }
+
+    private static String jsonFailure(DownloadResult.Failure f, int exitCode, JsonAccumulator chunks) {
+        String causeMsg = f.cause() == null ? "" : nullSafe(f.cause().getMessage());
+        StringBuilder j = new StringBuilder()
+                .append("{\"status\":\"failure\"")
+                .append(",\"error\":\"").append(f.error()).append('"')
+                .append(",\"exitCode\":").append(exitCode)
+                .append(",\"cause\":\"").append(jsonEscape(causeMsg)).append('"');
+        appendChunkDetails(j, chunks);
+        return j.append('}').toString();
+    }
+
+    private static void appendChunkDetails(StringBuilder j, JsonAccumulator chunks) {
+        if (chunks == null || chunks.chunks.isEmpty()) return;
+        j.append(",\"chunkDetails\":[");
+        for (int i = 0; i < chunks.chunks.size(); i++) {
+            if (i > 0) j.append(',');
+            ProgressEvent.ChunkCompleted c = chunks.chunks.get(i);
+            j.append("{\"index\":").append(c.index())
+             .append(",\"offset\":").append(c.offset())
+             .append(",\"length\":").append(c.length())
+             .append(",\"attempts\":").append(c.attempts())
+             .append(",\"durationMs\":").append(c.duration().toMillis())
+             .append('}');
+        }
+        j.append(']');
     }
 
     private static int exitCodeFor(DownloadResult.Failure f) {

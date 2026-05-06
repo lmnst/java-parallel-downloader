@@ -78,6 +78,54 @@ the downloader will:
 Single-stream downloads (servers without `Accept-Ranges`) cannot be resumed and
 ignore the flag.
 
+## Progress and reporting
+
+Set a `ProgressListener` on the options (CLI auto-installs one). The listener
+receives a sealed `ProgressEvent` stream — `Started`, then `ChunkCompleted` per
+chunk, then either `Finished` or `Failed`:
+
+```java
+DownloaderOptions opts = DownloaderOptions.builder()
+        .progressListener(event -> {
+            switch (event) {
+                case ProgressEvent.Started s     -> System.out.println("starting " + s.totalBytes() + "B");
+                case ProgressEvent.ChunkCompleted c -> System.out.println("chunk " + c.index() + " ok in " + c.duration());
+                case ProgressEvent.Finished f    -> System.out.println("done");
+                case ProgressEvent.Failed f      -> System.err.println("failed: " + f.error());
+            }
+        })
+        .build();
+```
+
+Events are dispatched from a single virtual thread, so listener implementations
+do **not** need to be thread-safe with respect to each other. A throwing
+listener is caught and the first exception is logged to `System.err` once with
+the event class name; the download proceeds.
+
+The CLI installs a live progress line in `--report text` mode (TTY: `\r`-overwriting
+`<bytes>/<total> @ <MiB/s> ETA <h:mm:ss> (n/N chunks)`; non-TTY: one line per
+chunk). With `--report json` the listener silently aggregates per-chunk
+durations and attempts, and the final JSON now includes a `chunkDetails`
+array:
+
+```json
+{
+  "status": "success",
+  "file": "/tmp/big.bin",
+  "bytes": 67108864,
+  "elapsedMs": 234,
+  "chunks": 8,
+  "sha256": "b5d4...",
+  "chunkDetails": [
+    {"index": 0, "offset": 0,        "length": 8388608, "attempts": 1, "durationMs": 30},
+    {"index": 1, "offset": 8388608,  "length": 8388608, "attempts": 1, "durationMs": 32}
+  ]
+}
+```
+
+Failure JSON has the same `chunkDetails` (capturing chunks that succeeded
+before the error), plus `error`, `exitCode`, and `cause`.
+
 ## Usage
 
 ```java
@@ -154,6 +202,7 @@ try (Downloader downloader = new Downloader(DownloaderOptions.defaults())) {
 Downloader            — download(URI, Path) / downloadAsync(URI, Path) / close()
 DownloaderOptions     — record + Builder; expectedDigest(Algorithm, byte[])
                                           ; resumeStrategy(ResumeStrategy)
+                                          ; progressListener(ProgressListener)
 DownloadResult        — sealed: Success | Failure; Success.sha256() : Optional<byte[]>
 DownloadError         — enum: HTTP_ERROR | IO_ERROR | SIZE_MISMATCH | INTEGRITY_FAILURE
                               | RESOURCE_CHANGED | CANCELLED | TIMEOUT | RANGES_NOT_SUPPORTED
@@ -163,6 +212,8 @@ HttpStatusException   — Failure.cause() for HTTP_ERROR; carries statusCode()
 Algorithm             — enum: SHA_256 (single member; extensible)
 ExpectedDigest        — record (algorithm, bytes); validated in compact ctor
 ResumeStrategy        — enum: FRESH (default) | RESUME_IF_VALID
+ProgressListener      — onProgress(ProgressEvent); NO_OP default
+ProgressEvent         — sealed: Started | ChunkCompleted | Failed | Finished
 cli.Main              — entry point for ./gradlew run
 ```
 

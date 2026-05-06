@@ -147,6 +147,30 @@ bitmap, fenced by `If-Range`, or terminated.
 Single-stream downloads (`!canParallel`) bypass the manifest entirely: there
 is no checkpointable state, so resumption is a no-op even when requested.
 
+## Progress dispatch and the single-thread invariant
+
+`DownloaderOptions.progressListener(...)` is observed via a small dispatcher
+that owns one virtual thread. Producers (the main thread before chunks fan
+out, and the per-chunk virtual threads after each successful write) `emit()`
+events into a `LinkedBlockingQueue`; the dispatcher thread loops `take()` →
+`listener.onProgress(event)`.
+
+The invariant — exactly one thread invokes the listener — means listener
+implementations do not need any synchronisation, and that mutable state inside
+the listener (e.g. a running `bytesCompleted` counter, a list of per-chunk
+durations) is safe without locks. The CLI's `JsonAccumulator` and
+`ConsoleProgressListener` both rely on this.
+
+A listener that throws is caught at the dispatcher; the first such exception
+is logged to `System.err` once with the event class name, and the download
+proceeds. Subsequent listener throws are dropped silently — silence at the end
+of the run is preferable to noisy logs that obscure the actual download
+result.
+
+When the listener is `ProgressListener.NO_OP` (the default), the dispatcher
+short-circuits — no thread, no queue — so users who don't care about progress
+pay nothing.
+
 ## Streaming integrity verification
 
 When `DownloaderOptions.expectedDigest(...)` is configured, the downloader

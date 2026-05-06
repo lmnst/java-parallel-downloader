@@ -68,6 +68,19 @@ public final class Downloader implements AutoCloseable {
     // ── core logic ───────────────────────────────────────────────────────────
 
     private DownloadResult doDownload(URI uri, Path dest, CancelToken cancel) {
+        try (ProgressDispatcher progress = new ProgressDispatcher(options.progressListener())) {
+            DownloadResult result = doDownloadInner(uri, dest, cancel, progress);
+            if (result instanceof DownloadResult.Success s) {
+                progress.emit(new ProgressEvent.Finished(s.bytes(), s.elapsed(), s.chunks()));
+            } else if (result instanceof DownloadResult.Failure f) {
+                progress.emit(new ProgressEvent.Failed(f.error(), f.cause()));
+            }
+            return result;
+        }
+    }
+
+    private DownloadResult doDownloadInner(URI uri, Path dest, CancelToken cancel,
+                                           ProgressDispatcher progress) {
         long startNanos = System.nanoTime();
 
         HttpAdapter.HeadResponse head;
@@ -93,6 +106,13 @@ public final class Downloader implements AutoCloseable {
         boolean resumeMode = options.resumeStrategy() == ResumeStrategy.RESUME_IF_VALID
                 && canParallel;
 
+        List<ByteRange> ranges = canParallel
+                ? RangePlanner.plan(head.contentLength(), options.chunkSize())
+                : null;
+        int chunkCount = canParallel ? ranges.size() : 1;
+
+        progress.emit(new ProgressEvent.Started(head.contentLength(), chunkCount));
+
         FileAssembler asm;
         try {
             asm = new FileAssembler(dest, resumeMode);
@@ -102,9 +122,10 @@ public final class Downloader implements AutoCloseable {
 
         try {
             if (canParallel) {
-                return parallelDownload(uri, dest, head, asm, resumeMode, cancel, startNanos);
+                return parallelDownload(uri, dest, head, ranges, asm, resumeMode,
+                        cancel, startNanos, progress);
             } else {
-                return singleStreamDownload(uri, dest, asm, cancel, startNanos);
+                return singleStreamDownload(uri, dest, asm, cancel, startNanos, progress);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -131,11 +152,11 @@ public final class Downloader implements AutoCloseable {
     }
 
     private DownloadResult parallelDownload(URI uri, Path dest, HttpAdapter.HeadResponse head,
-                                            FileAssembler asm, boolean resumeMode,
-                                            CancelToken cancel, long startNanos)
+                                            List<ByteRange> ranges, FileAssembler asm,
+                                            boolean resumeMode, CancelToken cancel,
+                                            long startNanos, ProgressDispatcher progress)
             throws IOException, InterruptedException {
 
-        List<ByteRange> ranges = RangePlanner.plan(head.contentLength(), options.chunkSize());
         RetryPolicy retry = new RetryPolicy(options);
 
         // ── manifest setup (resume mode only) ──────────────────────────────────
@@ -170,7 +191,7 @@ public final class Downloader implements AutoCloseable {
         ByteRange firstRange = ranges.get(0);
         if (manifest == null || !manifest.isCompleted(0)) {
             HttpAdapter.GetResponse probe =
-                    downloadChunk(0, firstRange, uri, asm, cancel, retry, ifRange);
+                    downloadChunk(0, firstRange, uri, asm, cancel, retry, ifRange, progress);
 
             if (probe.ifRangeMismatch()) {
                 throw new ResourceChangedException(
@@ -178,9 +199,6 @@ public final class Downloader implements AutoCloseable {
             }
 
             if (probe.status() == 200) {
-                // FRESH only: server returned full body at offset 0; no other chunks
-                // have run so no corruption. (RESUME mode would have failed above on
-                // ifRangeMismatch when If-Range was sent.)
                 long total = probe.bytesWritten();
                 if (head.contentLength() > 0 && total != head.contentLength()) {
                     throw new SizeMismatchException(head.contentLength(), total);
@@ -195,9 +213,6 @@ public final class Downloader implements AutoCloseable {
 
             validateContentRange(probe.contentRangeHeader(), firstRange, head.contentLength());
 
-            // Without this check a truncated body would silently leave zeros in the
-            // unwritten region of the temp file (most filesystems extend with zeros
-            // on a positional write past EOF).
             if (probe.bytesWritten() != firstRange.length()) {
                 throw new IOException("probe chunk truncated: got " + probe.bytesWritten()
                         + " of " + firstRange.length() + " bytes");
@@ -212,15 +227,12 @@ public final class Downloader implements AutoCloseable {
         // ── parallel chunks 1..N-1 (skip already-completed) ────────────────────
         if (ranges.size() > 1) {
             downloadChunksParallel(uri, ranges, asm, cancel, retry,
-                    head.contentLength(), manifest, ifRange);
+                    head.contentLength(), manifest, ifRange, progress);
         }
 
         if (cancel.isCancelled()) throw new InterruptedException("cancelled after chunks");
 
         long expected = head.contentLength();
-        // RangePlanner guarantees sum(range.length) == contentLength, and per-chunk
-        // truncation checks above ensure each chunk received its full body. Kept as
-        // a safety net.
         long totalWritten = ranges.stream().mapToLong(ByteRange::length).sum();
         if (expected > 0 && totalWritten != expected) {
             throw new SizeMismatchException(expected, totalWritten);
@@ -233,7 +245,8 @@ public final class Downloader implements AutoCloseable {
     private void downloadChunksParallel(URI uri, List<ByteRange> allRanges,
                                         FileAssembler asm, CancelToken cancel,
                                         RetryPolicy retry, long expectedTotal,
-                                        Manifest manifest, String ifRange)
+                                        Manifest manifest, String ifRange,
+                                        ProgressDispatcher progress)
             throws IOException, InterruptedException {
 
         Semaphore sem = new Semaphore(options.parallelism());
@@ -247,7 +260,7 @@ public final class Downloader implements AutoCloseable {
                 sem.acquire();
                 try {
                     HttpAdapter.GetResponse resp =
-                            downloadChunk(idx, range, uri, asm, cancel, retry, ifRange);
+                            downloadChunk(idx, range, uri, asm, cancel, retry, ifRange, progress);
                     if (resp.ifRangeMismatch()) {
                         throw new ResourceChangedException(
                                 "If-Range validator mismatch on chunk " + idx);
@@ -320,11 +333,12 @@ public final class Downloader implements AutoCloseable {
 
     private DownloadResult singleStreamDownload(URI uri, Path dest,
                                                 FileAssembler asm, CancelToken cancel,
-                                                long startNanos)
+                                                long startNanos, ProgressDispatcher progress)
             throws IOException, InterruptedException {
 
         RetryPolicy retry = new RetryPolicy(options);
-        HttpAdapter.GetResponse resp = downloadChunk(0, null, uri, asm, cancel, retry, null);
+        HttpAdapter.GetResponse resp =
+                downloadChunk(0, null, uri, asm, cancel, retry, null, progress);
 
         if (resp.status() != 200 && resp.status() != 206) {
             throw new HttpStatusException(resp.status());
@@ -336,15 +350,16 @@ public final class Downloader implements AutoCloseable {
 
     /**
      * Downloads one chunk with retry. A null range means "no Range header" (single-stream).
-     * A non-null ifRange threads through to the adapter as If-Range so the server can
-     * validate before returning 206. Returns the GetResponse on success; throws on
-     * permanent failure.
+     * On a successful body transfer (200 or 206 outside the retryable set) emits a
+     * {@link ProgressEvent.ChunkCompleted} with the actual attempts and elapsed duration.
      */
     private HttpAdapter.GetResponse downloadChunk(int chunkIndex, ByteRange range,
                                                    URI uri, FileAssembler asm,
                                                    CancelToken cancel, RetryPolicy retry,
-                                                   String ifRange)
+                                                   String ifRange, ProgressDispatcher progress)
             throws IOException, InterruptedException {
+
+        long startNanos = System.nanoTime();
 
         for (int attempt = 0; ; attempt++) {
             if (cancel.isCancelled()) throw new InterruptedException("cancelled before chunk " + chunkIndex);
@@ -361,6 +376,14 @@ public final class Downloader implements AutoCloseable {
                     if (delay.isEmpty()) throw new HttpStatusException(resp.status());
                     Thread.sleep(delay.get().toMillis());
                     continue;
+                }
+
+                if (resp.status() == 200 || resp.status() == 206) {
+                    long offset = range == null ? 0L : range.offset();
+                    long length = resp.bytesWritten();
+                    Duration duration = Duration.ofNanos(System.nanoTime() - startNanos);
+                    progress.emit(new ProgressEvent.ChunkCompleted(
+                            chunkIndex, offset, length, attempt + 1, duration));
                 }
 
                 return resp;
@@ -414,12 +437,6 @@ public final class Downloader implements AutoCloseable {
 
     // ── integrity verification ───────────────────────────────────────────────
 
-    /**
-     * Streams the temp file through MessageDigest with a 64 KiB single-pass read
-     * (no double-buffering), compares to the configured expected digest, and only
-     * then commits. On mismatch the destination is never touched: throwing keeps
-     * the temp file in place so doDownload's catch path runs asm.abort().
-     */
     private Optional<byte[]> verifyAndCommit(FileAssembler asm) throws IOException {
         Optional<byte[]> computed = Optional.empty();
         ExpectedDigest expected = options.expectedDigest();

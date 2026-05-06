@@ -11,7 +11,8 @@ public record DownloaderOptions(
         Duration retryBaseDelay,
         String userAgent,
         ExpectedDigest expectedDigest,
-        ResumeStrategy resumeStrategy
+        ResumeStrategy resumeStrategy,
+        ProgressListener progressListener
 ) {
     public DownloaderOptions {
         if (chunkSize <= 0) throw new IllegalArgumentException("chunkSize must be > 0, got: " + chunkSize);
@@ -27,6 +28,7 @@ public record DownloaderOptions(
         if (userAgent == null || userAgent.isBlank())
             throw new IllegalArgumentException("userAgent must not be blank");
         if (resumeStrategy == null) throw new IllegalArgumentException("resumeStrategy must not be null");
+        if (progressListener == null) throw new IllegalArgumentException("progressListener must not be null");
         // expectedDigest may be null (no integrity check requested)
     }
 
@@ -46,6 +48,7 @@ public record DownloaderOptions(
         private String userAgent = "parallel-downloader/1.0 (+java.net.http)";
         private ExpectedDigest expectedDigest = null;
         private ResumeStrategy resumeStrategy = ResumeStrategy.FRESH;
+        private ProgressListener progressListener = ProgressListener.NO_OP;
 
         public Builder chunkSize(long v)              { this.chunkSize = v; return this; }
         public Builder parallelism(int v)             { this.parallelism = v; return this; }
@@ -55,6 +58,7 @@ public record DownloaderOptions(
         public Builder retryBaseDelay(Duration v)     { this.retryBaseDelay = v; return this; }
         public Builder userAgent(String v)            { this.userAgent = v; return this; }
         public Builder resumeStrategy(ResumeStrategy v) { this.resumeStrategy = v; return this; }
+        public Builder progressListener(ProgressListener v) { this.progressListener = v; return this; }
 
         public Builder expectedDigest(Algorithm algorithm, byte[] bytes) {
             this.expectedDigest = new ExpectedDigest(algorithm, bytes);
@@ -64,7 +68,7 @@ public record DownloaderOptions(
         public DownloaderOptions build() {
             return new DownloaderOptions(chunkSize, parallelism, connectTimeout,
                     requestTimeout, maxRetriesPerChunk, retryBaseDelay, userAgent,
-                    expectedDigest, resumeStrategy);
+                    expectedDigest, resumeStrategy, progressListener);
         }
     }
 }
