@@ -214,6 +214,12 @@ the `ParallelismScalingBenchmark` source set spins up an in-process
 `com.sun.net.httpserver.HttpServer` with a configurable per-request
 delay knob and sweeps `parallelism` against it under JMH.
 
+For absolute-throughput grounding against `curl` and `wget` on a
+zero-RTT loopback fixture, see [docs/COMPARISON.md](docs/COMPARISON.md)
+(re-run with `docs/run-comparison.sh`). That document is the honest
+floor: single-connection clients win when there's no RTT to amortize,
+which is exactly the regime parallel range-GETs are not built for.
+
 ## Resumability
 
 Pass `--resume` (library: `DownloaderOptions.resumeStrategy(RESUME_IF_VALID)`).
