@@ -4,30 +4,25 @@
 ![Java](https://img.shields.io/badge/Java-21+-orange?logo=openjdk&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
-A Java 21 library and CLI for parallel, resumable, integrity-checked
-HTTP file downloads. Either the destination file matches a known
-SHA-256, or no artifact is written.
+```java
+try (Downloader dl = Downloader.create(opts)) {
+    DownloadResult result = dl.download(uri, dest);
+}
+```
 
-## Highlights
+A Java 21 library and CLI for parallel, resumable, HTTP file
+downloads. The shape is conventional; the value is in one invariant
+the implementation refuses to break.
 
-- **Parallel** ranged GETs over virtual threads, bounded by a
-  configurable parallelism semaphore. ~3.5x speedup over a single
-  stream on a high-RTT link (see [Performance](#performance)).
-- **Atomic commit**: a temp `<dest>.part` is `fsync`ed and
-  `Files.move`d with `ATOMIC_MOVE` only after every chunk has
-  written and the digest has been verified. The destination path
-  never holds a corrupt or partial file.
-- **Resumable** via a sidecar JSON manifest, fenced by `If-Range`
-  so a changed source resource fails fast instead of silently
-  splicing old and new bytes.
-- **Chaos-tested**: 120 seeded runs inject 14 fault classes into
-  every HTTP GET; the suite asserts the same invariant on every
-  seed. Success means correct bytes; failure means a typed error
-  with no leftover artifact.
-- **Zero runtime dependencies.** The shipped JAR contains nothing
-  outside the JDK.
+> **The invariant.** Either `dest` ends up holding bytes whose
+> SHA-256 matches the expected value, or no file appears at `dest`
+> and a typed error is returned. There is no in-between state, even
+> on crash, even under arbitrary HTTP fault injection.
 
-## Quick start
+The next sections show the artifact in motion, then explain the
+three pieces of code that make the invariant true.
+
+## Run it
 
 ```bash
 ./gradlew installDist
@@ -53,10 +48,67 @@ $DL --url http://localhost:8080/test.bin --out /tmp/dl.bin --report json
 }
 ```
 
-`just demo` runs the same end-to-end with a generated SHA-256 check
-and teardown. Full CLI reference: [`docs/USAGE.md`](docs/USAGE.md).
+`just demo` packages the same flow with a generated SHA-256 check
+and full teardown.
 
-## Library usage
+## Anatomy of a download
+
+![Download lifecycle sequence diagram](docs/architecture.svg)
+
+PlantUML source: [`docs/architecture.puml`](docs/architecture.puml).
+
+Three pieces of code make the invariant load-bearing rather than
+aspirational. Each one corresponds to a labelled phase in the
+diagram above.
+
+**Phase: probe chunk.** Some servers advertise `Accept-Ranges: bytes`
+in HEAD but ignore the `Range` header on the subsequent GET,
+returning the full body with status `200`. If N parallel chunks
+each receive the full body and write at their own offset, the
+destination file is corrupted silently. The probe chunk runs a
+synchronous GET at offset 0 *before* any other chunks fan out. A
+`200` is treated as the complete download and committed; no
+parallel writes ever happen, so corruption is impossible. A `206`
+confirms range support, and the remaining chunks fan out.
+
+**Phase: integrity gate.** When `expectedDigest(...)` is set, the
+temp file is streamed through a `MessageDigest` after the last
+chunk completes and *before* `Files.move(..., ATOMIC_MOVE)`. A
+mismatch fails with `INTEGRITY_FAILURE` and deletes the temp file.
+The destination path is never touched on failure, so a downstream
+watcher cannot observe a wrong-bytes file under the right name,
+even transiently.
+
+**Phase: resumption fence.** In `RESUME_IF_VALID` mode, a
+`<dest>.part.json` sidecar manifest is written and `fsync`ed after
+each chunk's successful write. It records URL, ETag (or
+`Last-Modified`), `Content-Length`, chunk size, and a hex bitmap of
+completed chunks. On retry, only missing chunks are re-fetched, and
+every ranged GET carries `If-Range: <validator>`. A `200` on a
+ranged GET with `If-Range` set means the server has replaced the
+resource; the adapter surfaces this and the downloader fails fast
+with `RESOURCE_CHANGED` rather than splicing old and new bytes.
+
+## Speed
+
+64 MiB file served from `httpd:2.4` with 50 ms one-way `netem`
+delay, 4 MiB chunks, median of three runs. Reproducible without
+Docker via `./gradlew jmh`.
+
+| `--parallelism` | Median time | Throughput | Speedup |
+|---:|---:|---:|---:|
+| 1 (single-stream) | 2929 ms | 21.8 MiB/s | 1.00x |
+| 4                 | 1298 ms | 49.3 MiB/s | 2.26x |
+| 8                 |  995 ms | 64.3 MiB/s | 2.94x |
+| 16                |  827 ms | 77.4 MiB/s | 3.54x |
+
+The shape of the curve is the load-bearing claim, not the absolute
+numbers. Speedup compounds until the BDP of the link is filled.
+
+For a zero-RTT loopback comparison against `curl` and `wget`, see
+[`docs/COMPARISON.md`](docs/COMPARISON.md).
+
+## API surface
 
 ```java
 try (Downloader dl = Downloader.create(DownloaderOptions.builder()
@@ -76,93 +128,32 @@ try (Downloader dl = Downloader.create(DownloaderOptions.builder()
 
 | Type | Role |
 |---|---|
-| `Downloader` | `download` / `downloadAsync` / `close` |
+| `Downloader` | `download` / `downloadAsync` / `close`. |
 | `DownloaderOptions` | Record + builder. `expectedDigest`, `resumeStrategy`, `progressListener`. |
 | `DownloadResult` | Sealed: `Success` or `Failure`. |
-| `DownloadError` | Enum: `HTTP_ERROR`, `IO_ERROR`, `SIZE_MISMATCH`, `INTEGRITY_FAILURE`, `RESOURCE_CHANGED`, `CANCELLED`, `TIMEOUT`, `RANGES_NOT_SUPPORTED`. |
+| `DownloadError` | `HTTP_ERROR`, `IO_ERROR`, `SIZE_MISMATCH`, `INTEGRITY_FAILURE`, `RESOURCE_CHANGED`, `CANCELLED`, `TIMEOUT`, `RANGES_NOT_SUPPORTED`. |
 | `ProgressListener` | SPI; `NO_OP` is the default. |
 | `ProgressEvent` | Sealed: `Started`, `ChunkCompleted`, `Failed`, `Finished`. |
 
-## Architecture
+CLI flag reference and exit codes are in
+[`docs/USAGE.md`](docs/USAGE.md).
 
-![Download lifecycle sequence diagram](docs/architecture.svg)
-
-Source: [`docs/architecture.puml`](docs/architecture.puml). Re-render
-with `java -jar plantuml.jar -tsvg docs/architecture.puml`.
-
-## Performance
-
-64 MiB file served from `httpd:2.4` with 50 ms one-way `netem`
-delay, 4 MiB chunks, median of three runs. Reproducible without
-Docker via `./gradlew jmh`.
-
-| `--parallelism` | Median time | Throughput | Speedup |
-|---:|---:|---:|---:|
-| 1 (single-stream) | 2929 ms | 21.8 MiB/s | 1.00x |
-| 4                 | 1298 ms | 49.3 MiB/s | 2.26x |
-| 8                 |  995 ms | 64.3 MiB/s | 2.94x |
-| 16                |  827 ms | 77.4 MiB/s | 3.54x |
-
-The shape of the curve is the load-bearing claim, not the absolute
-numbers. Speedup compounds until the BDP of the link is filled.
-
-For a zero-RTT loopback comparison against `curl` and `wget`, see
-[`docs/COMPARISON.md`](docs/COMPARISON.md).
-
-## Correctness model
-
-Three claims, each enforced at one place in the code and verified
-under seeded fault injection.
-
-### 1. Probe chunk before parallel fan-out
-
-Some servers advertise `Accept-Ranges: bytes` in HEAD but ignore
-the `Range` header on a subsequent GET, returning the full body
-with status `200`. If N parallel chunks each receive the full body
-and write at their own offset, the destination file is corrupted
-silently.
-
-A synchronous probe chunk at offset 0 runs before any other chunks
-fan out. If the probe returns `200`, the body is committed as the
-complete download; no parallel writes ever happen, so corruption is
-impossible. If the probe returns `206`, range support is confirmed
-and the remaining chunks fan out under the parallelism semaphore.
-
-### 2. Integrity is verified before the atomic move
-
-When `expectedDigest(...)` is set, the temp file is streamed
-through a `MessageDigest` after the last chunk completes and
-*before* `Files.move(..., ATOMIC_MOVE)`. A mismatch fails with
-`INTEGRITY_FAILURE` and deletes the temp file. The destination
-path is never touched on failure, so a downstream watcher cannot
-observe a wrong-bytes file under the right name even transiently.
-
-### 3. Resumption is fenced by `If-Range`
-
-In `RESUME_IF_VALID` mode, a `<dest>.part.json` sidecar manifest is
-written after each chunk's successful write and fsync. It records
-URL, ETag (or `Last-Modified`), `Content-Length`, chunk size, and a
-hex bitmap of completed chunks.
-
-On retry, only missing chunks are re-fetched, and every ranged GET
-carries `If-Range: <validator>`. A `200` on a ranged GET with
-`If-Range` set means the server has replaced the resource; the
-adapter surfaces this and the downloader fails fast with
-`RESOURCE_CHANGED` rather than splicing old and new bytes.
-
-## Testing
+## Tests
 
 | Layer | Count | What it covers |
 |---|---:|---|
 | Unit | 153 | Range planner, manifest, file assembler, retry policy, JSON encoder, CLI parser. |
 | Property | (in unit) | `RangePlanner` covers `totalBytes` exactly across random sizes. |
 | Integration | 4 | Real `httpd:2.4` via Testcontainers; full lifecycle through CLI binary. |
-| Chaos | 120 seeds | 14 fault classes per HTTP GET; invariants asserted on every seed. |
+| Chaos | 120 seeds | 14 fault classes per HTTP GET; the invariant is asserted on every seed. |
 
-The chaos invariant: *Success implies the destination matches the
-source SHA-256; Failure implies a typed `DownloadError` with no
-leftover artifact at the destination.* No "best-effort" middle
-ground is permitted.
+The chaos suite is opt-in via `-PchaosTests` and exists because the
+invariant is about *combinations* of failures (a `503` on chunk 0,
+a truncated body on chunk 4, a malformed `Content-Range` on chunk 7,
+all in the same run). 14 fault classes times 8 chunks per run is a
+combinatorial space too large to enumerate by hand. A property test
+seeds the RNG and lets the harness explore; when it finds a bug,
+the seed in the failure message replays the exact sequence.
 
 ## Build
 
@@ -174,19 +165,22 @@ ground is permitted.
 ```
 
 CI runs the full check on Linux, macOS, and Windows on every push.
-Requires Java 21 or newer; Gradle 8.13 wrapper included.
+Requires Java 21 or newer. The Gradle 8.13 wrapper is included; no
+system Gradle install is needed.
 
-## Further reading
+The non-test runtime has no third-party dependencies.
 
-- [`DESIGN.md`](DESIGN.md): trade-offs, resumption state machine,
-  the chaos invariant, what was deliberately left out.
-- [`docs/USAGE.md`](docs/USAGE.md): full CLI reference, exit-code
-  table, library and listener examples.
-- [`docs/COMPARISON.md`](docs/COMPARISON.md): vs `curl`, `wget` on
-  zero-RTT loopback.
-- [`docs/STORY-TESTCONTAINERS-DOCKER.md`](docs/STORY-TESTCONTAINERS-DOCKER.md):
-  debugging episode about a silent integration-test skip on Docker
-  Engine 29.
+## Reading on
+
+- [`DESIGN.md`](DESIGN.md) for trade-offs, the resumption state
+  machine, and what was deliberately left out.
+- [`docs/USAGE.md`](docs/USAGE.md) for the full CLI reference and
+  exit-code table.
+- [`docs/COMPARISON.md`](docs/COMPARISON.md) for the loopback
+  benchmark against `curl` and `wget`.
+- [`docs/STORY-TESTCONTAINERS-DOCKER.md`](docs/STORY-TESTCONTAINERS-DOCKER.md)
+  for a debugging episode about a silent integration-test skip on
+  Docker Engine 29.
 
 ## License
 
