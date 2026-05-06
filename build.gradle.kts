@@ -20,6 +20,11 @@ repositories {
     mavenCentral()
 }
 
+val bench: SourceSet = sourceSets.create("bench") {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
 dependencies {
     implementation("org.jspecify:jspecify:1.0.0")
     compileOnly("org.jetbrains:annotations:24.1.0")
@@ -30,6 +35,9 @@ dependencies {
     testImplementation("org.testcontainers:testcontainers:2.0.5")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.16")
+
+    "benchImplementation"("org.openjdk.jmh:jmh-core:1.37")
+    "benchAnnotationProcessor"("org.openjdk.jmh:jmh-generator-annprocess:1.37")
 }
 
 tasks.test {
@@ -49,4 +57,21 @@ tasks.javadoc {
         addBooleanOption("Xdoclint:all", true)
         addBooleanOption("Werror", true)
     }
+}
+
+tasks.register<JavaExec>("jmh") {
+    group = "verification"
+    description = "Runs JMH benchmarks. -Pjmh.include=<regex>, -Pjmh.args='<extra JMH flags>'."
+    dependsOn("benchClasses")
+    classpath = bench.runtimeClasspath
+    mainClass.set("org.openjdk.jmh.Main")
+    // Pin the parent (and forked) JVM to the project's JDK 21 toolchain so the
+    // bench classes (compiled at class file version 65) actually load.
+    javaLauncher.set(javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    })
+    val pattern = providers.gradleProperty("jmh.include").getOrElse(".*Benchmark")
+    val extra = providers.gradleProperty("jmh.args").getOrElse("")
+    args(pattern)
+    if (!extra.isBlank()) args(extra.trim().split("\\s+".toRegex()))
 }

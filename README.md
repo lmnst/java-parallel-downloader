@@ -209,6 +209,11 @@ Numbers were collected on an Apple Silicon laptop in May 2026; absolute
 times will vary by hardware, but the relative shape (super-linear gain
 through `p=4`, plateau around `p=8`) is the load-bearing claim.
 
+For a Docker-free re-derivation of the same shape, run `./gradlew jmh`:
+the `ParallelismScalingBenchmark` source set spins up an in-process
+`com.sun.net.httpserver.HttpServer` with a configurable per-request
+delay knob and sweeps `parallelism` against it under JMH.
+
 ## Resumability
 
 Pass `--resume` (library: `DownloaderOptions.resumeStrategy(RESUME_IF_VALID)`).
