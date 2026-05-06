@@ -20,7 +20,6 @@ public sealed interface ProgressEvent {
      * @param totalBytes  total bytes to download, or {@code -1} if unknown
      * @param chunkCount  number of chunks the planner produced
      */
-    @org.jetbrains.annotations.ApiStatus.Experimental
     record Started(long totalBytes, int chunkCount) implements ProgressEvent {}
 
     /**
@@ -34,7 +33,6 @@ public sealed interface ProgressEvent {
      * @param attempts attempts made (1 = succeeded on the first try)
      * @param duration wall-clock time spent on this chunk
      */
-    @org.jetbrains.annotations.ApiStatus.Experimental
     record ChunkCompleted(int index, long offset, long length,
                           int attempts, Duration duration) implements ProgressEvent {}
 
@@ -45,7 +43,6 @@ public sealed interface ProgressEvent {
      * @param error the typed error category
      * @param cause the underlying exception, or null if none
      */
-    @org.jetbrains.annotations.ApiStatus.Experimental
     record Failed(DownloadError error, Throwable cause) implements ProgressEvent {}
 
     /**
@@ -56,6 +53,5 @@ public sealed interface ProgressEvent {
      * @param elapsed total wall-clock time
      * @param chunks  chunk count
      */
-    @org.jetbrains.annotations.ApiStatus.Experimental
     record Finished(long bytes, Duration elapsed, int chunks) implements ProgressEvent {}
 }

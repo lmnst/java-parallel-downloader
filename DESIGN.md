@@ -247,6 +247,14 @@ Single-stream downloads (`!canParallel`) bypass the manifest entirely:
 there is no checkpointable state, so resumption is a no-op even when
 requested.
 
+`ResumeStrategy` carries `@ApiStatus.Experimental` because the two-member
+enum is the smallest committed surface — a third value such as
+`RESUME_OR_FRESH` (try resume; on validator drift fall back silently
+instead of returning `RESOURCE_CHANGED`) is plausible enough that callers
+should expect the enum to grow. The `ProgressEvent` records, by contrast,
+are spec-fixed by what HTTP downloads produce (offset, length, attempts,
+duration), so they are not annotated.
+
 ## Streaming integrity verification
 
 When `DownloaderOptions.expectedDigest(...)` is configured, the downloader
